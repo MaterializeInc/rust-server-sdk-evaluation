@@ -7,6 +7,8 @@
 #![deny(rustdoc::missing_crate_level_docs)]
 #![deny(missing_docs)]
 
+mod attribute_value;
+mod contexts;
 mod eval;
 mod flag;
 mod flag_value;
@@ -14,18 +16,28 @@ mod rule;
 mod segment;
 mod store;
 mod test_common;
-mod user;
 mod util;
 mod variation;
 
+pub use attribute_value::AttributeValue;
+pub use contexts::attribute_reference::Reference;
+pub use contexts::context::{Context, ContextAttributes, Kind};
+pub use contexts::context_builder::{ContextBuilder, MultiContextBuilder};
 pub use eval::*;
 pub use flag::*;
 pub use flag_value::*;
 pub use rule::*;
 pub use segment::*;
 pub use store::*;
-pub use user::*;
 pub use variation::*;
+
+#[cfg(test)]
+pub(crate) mod proptest_generators {
+    pub(crate) use crate::contexts::attribute_reference::proptest_generators::*;
+    pub(crate) use crate::contexts::context::proptest_generators::*;
+    pub(crate) use crate::rule::proptest_generators::*;
+    pub(crate) use crate::variation::proptest_generators::*;
+}
 
 /// Trait indicating that the item is versioned.
 pub trait Versioned {

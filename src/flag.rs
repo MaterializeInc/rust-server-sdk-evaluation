@@ -8,12 +8,12 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+use crate::contexts::context::Kind;
 use crate::eval::{self, Detail, Reason};
 use crate::flag_value::FlagValue;
 use crate::rule::FlagRule;
-use crate::user::User;
 use crate::variation::{VariationIndex, VariationOrRollout};
-use crate::{BucketResult, Versioned};
+use crate::{BucketResult, Context, Versioned};
 
 /// Flag describes an individual feature flag.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +30,9 @@ pub struct Flag {
     pub(crate) on: bool,
 
     pub(crate) targets: Vec<Target>,
+
+    #[serde(default)]
+    pub(crate) context_targets: Vec<Target>,
     pub(crate) rules: Vec<FlagRule>,
     pub(crate) prerequisites: Vec<Prereq>,
 
@@ -59,7 +62,7 @@ pub struct Flag {
     /// This field is true if the current LaunchDarkly account has experimentation enabled, has associated
     /// this flag with an experiment, and has enabled "default rule" for the experiment. This tells the
     /// SDK to send full event data for any evaluation where this flag had targeting turned on but the
-    /// user did not match any targets or rules.
+    /// context did not match any targets or rules.
     ///
     /// The launchdarkly-server-sdk-evaluation package does not implement that behavior; it is only
     /// in the data model for use by the SDK.
@@ -85,10 +88,6 @@ impl Versioned for Flag {
     }
 }
 
-// TODO(mmk) Do we have to deal with serializing this to the old format if it was deserialized that
-// way?
-// This struct exists only so we can add some custom deserialization logic to account for the
-// potential presence of a client_side field in lieu of the client_side_availability field.
 #[derive(Clone, Debug)]
 struct ClientVisibility {
     client_side_availability: ClientSideAvailability,
@@ -185,7 +184,11 @@ pub struct Prereq {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Target {
+    #[serde(default)]
+    pub(crate) context_kind: Kind,
+
     pub(crate) values: Vec<String>,
     pub(crate) variation: VariationIndex,
 }
@@ -193,7 +196,7 @@ pub(crate) struct Target {
 /// ClientSideAvailability describes whether a flag is available to client-side SDKs.
 ///
 /// This field can be used by a server-side client to determine whether to include an individual flag in
-/// bootstrapped set of flag data (see <https://docs.launchdarkly.com/sdk/client-side/javascript#bootstrapping>).
+/// bootstrapped set of flag data (see [Bootstrapping the Javascript SDK](https://docs.launchdarkly.com/sdk/client-side/javascript#bootstrapping)).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSideAvailability {
@@ -265,9 +268,10 @@ impl Flag {
     pub(crate) fn resolve_variation_or_rollout(
         &self,
         vr: &VariationOrRollout,
-        user: &User,
+        context: &Context,
     ) -> Result<BucketResult, eval::Error> {
-        vr.variation(&self.key, user, &self.salt)
+        vr.variation(&self.key, context, &self.salt)
+            .map_err(|_| eval::Error::MalformedFlag)?
             .ok_or(eval::Error::MalformedFlag)
     }
 
@@ -289,13 +293,13 @@ impl Flag {
     }
 
     #[cfg(test)]
-    pub fn new_boolean_flag_with_segment_match(segment_keys: Vec<&str>) -> Self {
+    pub(crate) fn new_boolean_flag_with_segment_match(segment_keys: Vec<&str>, kind: Kind) -> Self {
         Self {
             key: "feature".to_string(),
             version: 1,
             on: true,
             targets: vec![],
-            rules: vec![crate::rule::FlagRule::new_segment_match(segment_keys)],
+            rules: vec![FlagRule::new_segment_match(segment_keys, kind)],
             prerequisites: vec![],
             fallthrough: VariationOrRollout::Variation { variation: 0 },
             off_variation: Some(0),
@@ -311,6 +315,7 @@ impl Flag {
             track_events: false,
             track_events_fallthrough: false,
             debug_events_until_date: None,
+            context_targets: vec![],
         }
     }
 }
@@ -327,7 +332,7 @@ mod tests {
 
     #[test_case(true)]
     #[test_case(false)]
-    fn handles_old_flag_schema(client_side: bool) {
+    fn handles_client_side_schema(client_side: bool) {
         let json = &format!(
             r#"{{
             "key": "flag",
@@ -349,7 +354,7 @@ mod tests {
         let client_side_availability = &flag.client_visibility.client_side_availability;
         assert_eq!(client_side_availability.using_environment_id, client_side);
         assert!(client_side_availability.using_mobile_key);
-        assert_eq!(client_side_availability.explicit, false);
+        assert!(!client_side_availability.explicit);
 
         assert_eq!(flag.using_environment_id(), client_side);
     }
@@ -363,6 +368,7 @@ mod tests {
   "version": 42,
   "on": false,
   "targets": [],
+  "contextTargets": [],
   "rules": [],
   "prerequisites": [],
   "fallthrough": {{
@@ -390,7 +396,7 @@ mod tests {
 
     #[test_case(true)]
     #[test_case(false)]
-    fn handles_new_flag_schema(using_environment_id: bool) {
+    fn handles_client_side_availability_schema(using_environment_id: bool) {
         let json = &format!(
             r#"{{
             "key": "flag",
@@ -418,9 +424,65 @@ mod tests {
             using_environment_id
         );
         assert!(!client_side_availability.using_mobile_key);
-        assert_eq!(client_side_availability.explicit, true);
+        assert!(client_side_availability.explicit);
 
         assert_eq!(flag.using_environment_id(), using_environment_id);
+    }
+
+    #[test_case(true)]
+    #[test_case(false)]
+    fn handles_context_target_schema(using_environment_id: bool) {
+        let json = &format!(
+            r#"{{
+            "key": "flag",
+            "version": 42,
+            "on": false,
+            "targets": [{{
+                "values": ["Bob"],
+                "variation": 1
+            }}],
+            "contextTargets": [{{
+                "contextKind": "org",
+                "values": ["LaunchDarkly"],
+                "variation": 0
+            }}],
+            "rules": [],
+            "prerequisites": [],
+            "fallthrough": {{"variation": 1}},
+            "offVariation": 0,
+            "variations": [false, true],
+            "clientSideAvailability": {{
+                "usingEnvironmentId": {},
+                "usingMobileKey": false
+            }},
+            "salt": "salty"
+        }}"#,
+            using_environment_id
+        );
+
+        let flag: Flag = serde_json::from_str(json).unwrap();
+        assert_eq!(1, flag.targets.len());
+        assert!(flag.targets[0].context_kind.is_user());
+
+        assert_eq!(1, flag.context_targets.len());
+        assert_eq!("org", flag.context_targets[0].context_kind.as_ref());
+    }
+
+    #[test]
+    fn getting_variation_with_invalid_index_is_handled_appropriately() {
+        let store = TestStore::new();
+        let flag = store.flag("flag").unwrap();
+
+        let detail = flag.variation(-1, Off);
+
+        assert!(detail.value.is_none());
+        assert!(detail.variation_index.is_none());
+        assert_eq!(
+            detail.reason,
+            Error {
+                error: crate::Error::MalformedFlag
+            }
+        );
     }
 
     #[test_case(true, true)]
@@ -437,6 +499,7 @@ mod tests {
   "version": 42,
   "on": false,
   "targets": [],
+  "contextTargets": [],
   "rules": [],
   "prerequisites": [],
   "fallthrough": {{

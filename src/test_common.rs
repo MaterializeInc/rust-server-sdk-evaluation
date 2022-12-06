@@ -73,6 +73,152 @@ impl TestStore {
                         "trackEventsFallthrough": true,
                         "debugEventsUntilDate": 1500000000
                     }"#).unwrap(),
+                "flagWithMatchesOpOnGroups".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithMatchesOpOnGroups",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [
+                            {
+                                "variation": 0,
+                                "id": "6a7755ac-e47a-40ea-9579-a09dd5f061bd",
+                                "clauses": [
+                                    {
+                                        "attribute": "groups",
+                                        "op": "matches",
+                                        "values": [
+                                            "^\\w+"
+                                        ],
+                                        "negate": false
+                                    }
+                                ],
+                                "trackEvents": true
+                            }
+                        ],
+                        "prerequisites": [],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty",
+                        "trackEvents": false,
+                        "trackEventsFallthrough": true,
+                        "debugEventsUntilDate": 1500000000
+                    }"#).unwrap(),
+                "flagWithMatchesOpOnKinds".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithMatchesOpOnKinds",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [
+                            {
+                                "variation": 0,
+                                "id": "6a7755ac-e47a-40ea-9579-a09dd5f061bd",
+                                "clauses": [
+                                    {
+                                        "attribute": "kind",
+                                        "op": "matches",
+                                        "values": [
+                                            "^[ou]"
+                                        ],
+                                        "negate": false
+                                    }
+                                ],
+                                "trackEvents": true
+                            }
+                        ],
+                        "prerequisites": [],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty",
+                        "trackEvents": false,
+                        "trackEventsFallthrough": true,
+                        "debugEventsUntilDate": 1500000000
+                    }"#).unwrap(),
+                "flagWithMatchesOpOnKindsAttributeReference".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithMatchesOpOnKindsAttributeReference",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [
+                            {
+                                "variation": 0,
+                                "id": "6a7755ac-e47a-40ea-9579-a09dd5f061bd",
+                                "clauses": [
+                                    {
+                                        "attribute": "/kind",
+                                        "op": "matches",
+                                        "values": [
+                                            "^[ou]"
+                                        ],
+                                        "negate": false,
+                                        "contextKind" : "arbitrary"
+                                    }
+                                ],
+                                "trackEvents": true
+                            }
+                        ],
+                        "prerequisites": [],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty",
+                        "trackEvents": false,
+                        "trackEventsFallthrough": true,
+                        "debugEventsUntilDate": 1500000000
+                    }"#).unwrap(),
+                "flagWithMatchesOpOnKindsPlainAttributeReference".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithMatchesOpOnKindsPlainAttributeReference",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [
+                            {
+                                "variation": 0,
+                                "id": "6a7755ac-e47a-40ea-9579-a09dd5f061bd",
+                                "clauses": [
+                                    {
+                                        "attribute": "kind",
+                                        "op": "matches",
+                                        "values": [
+                                            "^[ou]"
+                                        ],
+                                        "negate": false,
+                                        "contextKind" : "arbitrary"
+                                    }
+                                ],
+                                "trackEvents": true
+                            }
+                        ],
+                        "prerequisites": [],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty",
+                        "trackEvents": false,
+                        "trackEventsFallthrough": true,
+                        "debugEventsUntilDate": 1500000000
+                    }"#).unwrap(),
                 "flagWithTrackAndDebugEvents".to_string() => serde_json::from_str(r#"{
                         "key": "flag",
                         "version": 42,
@@ -103,6 +249,37 @@ impl TestStore {
                         "fallthrough": {
                           "rollout": {
                             "kind": "experiment",
+                            "seed": 61,
+                            "variations": [
+                              {"variation": 0, "weight": 10000, "untracked": false},
+                              {"variation": 1, "weight": 20000, "untracked": false},
+                              {"variation": 0, "weight": 70000, "untracked": true}
+                            ]
+                          }
+                        },
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty",
+                        "trackEvents": false,
+                        "trackEventsFallthrough": false,
+                        "debugEventsUntilDate": 1500000000
+                    }"#).unwrap(),
+                "flagWithExperimentTargetingContext".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithExperimentTargetingContext",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [],
+                        "prerequisites": [],
+                        "fallthrough": {
+                          "rollout": {
+                            "kind": "experiment",
+                            "contextKind": "org",
                             "seed": 61,
                             "variations": [
                               {"variation": 0, "weight": 10000, "untracked": false},
@@ -203,6 +380,35 @@ impl TestStore {
                         },
                         "salt": "salty"
                     }"#).unwrap(),
+                "flagWithContextTarget".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithContextTarget",
+                        "version": 42,
+                        "on": true,
+                        "targets": [{
+                            "values": ["bob"],
+                            "variation": 1
+                        }],
+                        "contextTargets": [{
+                            "contextKind": "org",
+                            "values": ["LaunchDarkly"],
+                            "variation": 1
+                        }, {
+                            "contextKind": "user",
+                            "values": [],
+                            "variation": 1
+                        }],
+                        "rules": [],
+                        "prerequisites": [],
+                        "fallthrough": {"variation": 0},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty"
+                    }"#).unwrap(),
                 "flagWithMissingPrereq".to_string() => serde_json::from_str(r#"{
                         "key": "flagWithMissingPrereq",
                         "version": 42,
@@ -231,6 +437,30 @@ impl TestStore {
                         "rules": [],
                         "prerequisites": [{
                             "key": "offPrereq",
+                            "variation": 1
+                        }],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty"
+                    }"#).unwrap(),
+                "flagWithFirstPrereqAsPrereqToSecondPrereq".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithFirstPrereqAsPrereqToSecondPrereq",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [],
+                        "prerequisites": [{
+                            "key": "prereq",
+                            "variation": 1
+                        },
+                        {
+                            "key": "flagWithSatisfiedPrereq",
                             "variation": 1
                         }],
                         "fallthrough": {"variation": 1},
@@ -355,7 +585,8 @@ impl TestStore {
                         "rules": [{
                             "id": "match-rule",
                             "clauses": [{
-                                "attribute": "segmentMatch",
+                                "contextKind": "user",
+                                "attribute": "key",
                                 "negate": false,
                                 "op": "segmentMatch",
                                 "values": ["segment"]
@@ -364,6 +595,37 @@ impl TestStore {
                             "trackEvents": false
                         }],
                         "prerequisites": [],
+                        "fallthrough": {"variation": 1},
+                        "offVariation": 0,
+                        "variations": [false, true],
+                        "clientSide": true,
+                        "clientSideAvailability": {
+                            "usingEnvironmentId": true,
+                            "usingMobileKey": true
+                        },
+                        "salt": "salty"
+                    }"#).unwrap(),
+                "flagWithPrereqWhichDuplicatesSegmentRuleCheck".to_string() => serde_json::from_str(r#"{
+                        "key": "flagWithPrereqWhichDuplicatesSegmentRuleCheck",
+                        "version": 42,
+                        "on": true,
+                        "targets": [],
+                        "rules": [{
+                            "id": "match-rule",
+                            "clauses": [{
+                                "contextKind": "user",
+                                "attribute": "key",
+                                "negate": false,
+                                "op": "segmentMatch",
+                                "values": ["segment"]
+                            }],
+                            "variation": 0,
+                            "trackEvents": false
+                        }],
+                        "prerequisites": [{
+                            "key": "flagWithSegmentMatchRule",
+                            "variation": 0
+                        }],
                         "fallthrough": {"variation": 1},
                         "offVariation": 0,
                         "variations": [false, true],
@@ -405,6 +667,10 @@ impl TestStore {
                 "segment".to_string() => serde_json::from_str(r#"{
                         "key": "segment",
                         "included": ["alice"],
+                        "includedContexts": [{
+                            "values": [],
+                            "contextKind": "user"
+                        }],
                         "excluded": [],
                         "rules": [],
                         "salt": "salty",
@@ -412,6 +678,13 @@ impl TestStore {
                     }"#).unwrap()
             },
         }
+    }
+
+    pub fn new_from_json_str(flag_json: &str, segment_json: &str) -> Self {
+        let flags = serde_json::from_str(flag_json).unwrap();
+        let segments = serde_json::from_str(segment_json).unwrap();
+
+        Self { flags, segments }
     }
 
     pub fn update_flag(&mut self, flag_key: &str, fun: fn(&mut Flag) -> ()) {
@@ -422,11 +695,11 @@ impl TestStore {
 
 impl Store for TestStore {
     fn flag(&self, flag_key: &str) -> Option<Flag> {
-        self.flags.get(flag_key).map(|f| f.clone())
+        self.flags.get(flag_key).cloned()
     }
 
     fn segment(&self, segment_key: &str) -> Option<Segment> {
-        self.segments.get(segment_key).map(|f| f.clone())
+        self.segments.get(segment_key).cloned()
     }
 }
 

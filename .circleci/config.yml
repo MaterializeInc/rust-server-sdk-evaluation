@@ -8,7 +8,13 @@ workflows:
 jobs:
   test:
     docker:
-      - image: cimg/rust:1.56.1
+        # Note about build failures:
+        # If the rust version is updated, and unexpected compiler errors are emitted, it might be
+        # due to the CircleCI build cache containing old artifacts built with previous version.
+        # To solve: increment the CACHE_VERSION environment variable in the CircleCI Project settings.
+        # Example: if the current CACHE_VERSION is 'xxxx2' (this value isn't sensitive, but CircleCI masks it)
+        # then it means the current version is 'v2', so the next should be 'v3'.
+      - image: cimg/rust:1.60.0
     steps:
       - checkout
       - run:
@@ -20,38 +26,41 @@ jobs:
           name: Restore Cargo cache
           keys:
             # when lock file changes, use increasingly general patterns to restore cache
-            - v1-cargo-cache-{{ arch }}-{{ .Branch }}-{{ checksum "Cargo.toml" }}
-            - v1-cargo-cache-{{ arch }}-{{ .Branch }}-
-            - v1-cargo-cache-{{ arch }}-
+            - eval-{{ .Environment.CACHE_VERSION }}-cargo-cache-{{ arch }}-{{ .Branch }}-{{ checksum "Cargo.toml" }}
+            - eval-{{ .Environment.CACHE_VERSION }}-cargo-cache-{{ arch }}-{{ .Branch }}-
+            - eval-{{ .Environment.CACHE_VERSION }}-cargo-cache-{{ arch }}-
       - run:
           command: cargo fetch
       - save_cache:
           name: Save Cargo cache
           paths:
             - ~/.cargo
-          key: v1-cargo-cache-{{ arch }}-{{ .Branch }}-{{ checksum "Cargo.toml" }}
+          key: eval-{{ .Environment.CACHE_VERSION }}-cargo-cache-{{ arch }}-{{ .Branch }}-{{ checksum "Cargo.toml" }}
 
       - restore_cache:
           name: Restore Rustup cache
           keys:
             # use increasingly general patterns to restore cache
-            - v1-rustup-cache-{{ arch }}-{{ .Branch }}
-            - v1-rustup-cache-{{ arch }}-
+            - eval-{{ .Environment.CACHE_VERSION }}-rustup-cache-{{ arch }}-{{ .Branch }}
+            - eval-{{ .Environment.CACHE_VERSION }}-rustup-cache-{{ arch }}-
       - run: rustup target add wasm32-wasi
       - save_cache:
           name: Save Rustup cache
           paths:
             - ~/.rustup
-          key: v1-rustup-cache-{{ arch }}-{{ .Branch }}
+          key: eval-{{ .Environment.CACHE_VERSION }}-rustup-cache-{{ arch }}-{{ .Branch }}
       - run:
           name: Check Formatting
           command: cargo fmt && git diff --exit-code
       - run:
           name: Clippy
-          command: cargo clippy -- -D warnings
+          command: cargo clippy --all-features -- -D warnings
+      - run:
+          name: Install cargo-all-features crate
+          command: cargo install cargo-all-features
       - run:
           name: Test
-          command: cargo test
+          command: cargo test-all-features
       - run:
           name: Gather Coverage
           command: ./coverage.sh --html
@@ -67,7 +76,7 @@ jobs:
           command: cargo build --target wasm32-wasi
       - run:
           name: Generate Docs
-          command: cargo doc --no-deps
+          command:  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       - store_artifacts:
           name: Upload Docs
           path: target/doc

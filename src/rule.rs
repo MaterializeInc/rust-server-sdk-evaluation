@@ -1,35 +1,140 @@
+use crate::attribute_value::AttributeValue;
+use crate::contexts::attribute_reference::AttributeName;
+use crate::contexts::context::Kind;
+use crate::store::Store;
+use crate::variation::VariationOrRollout;
+use crate::{util, Context, EvaluationStack, Reference};
 use chrono::{self, Utc};
 use log::{error, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
+use util::is_false;
 
-use crate::store::Store;
-use crate::user::{AttributeValue, User};
-use crate::variation::VariationOrRollout;
-
-/// Clause describes an individual clause within a [FlagRule] or SegmentRule.
+/// Clause describes an individual clause within a [crate::FlagRule] or `SegmentRule`.
+// Clause is deserialized via a helper, IntermediateClause, because of semantic ambiguity
+// of the attribute Reference field.
+//
+// Clause implements Serialize directly without a helper because References can serialize
+// themselves without any ambiguity.
+#[skip_serializing_none]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", from = "IntermediateClause")]
 pub struct Clause {
-    attribute: String,
+    // Kind associated with this clause.
+    context_kind: Kind,
+    // Which context attribute to test. If op does not require an attribute,
+    // then the input may be an empty string, which will construct an invalid
+    // reference.
+    attribute: Reference,
+    // True if the result of the test should be negated.
+    // Skip serializing if false because it is optional in the JSON model.
+    #[serde(skip_serializing_if = "is_false")]
+    negate: bool,
+    // The test operation.
+    op: Op,
+    // The values to test against.
+    values: Vec<AttributeValue>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ClauseWithKind {
+    context_kind: Kind,
+    attribute: Reference,
+    #[serde(default)]
     negate: bool,
     op: Op,
     values: Vec<AttributeValue>,
 }
 
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ClauseWithoutKind {
+    attribute: AttributeName,
+    #[serde(default)]
+    negate: bool,
+    op: Op,
+    values: Vec<AttributeValue>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum IntermediateClause {
+    // ClauseWithKind must be listed first in the enum because otherwise ClauseWithoutKind
+    // could match the input (by ignoring/discarding the context_kind field).
+    ContextAware(ClauseWithKind),
+    ContextOblivious(ClauseWithoutKind),
+}
+
+impl From<IntermediateClause> for Clause {
+    fn from(ic: IntermediateClause) -> Self {
+        match ic {
+            IntermediateClause::ContextAware(fields) => Self {
+                context_kind: fields.context_kind,
+                attribute: fields.attribute,
+                negate: fields.negate,
+                op: fields.op,
+                values: fields.values,
+            },
+            IntermediateClause::ContextOblivious(fields) => Self {
+                context_kind: Kind::default(),
+                attribute: Reference::from(fields.attribute),
+                negate: fields.negate,
+                op: fields.op,
+                values: fields.values,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod proptest_generators {
+    use super::Clause;
+    use crate::contexts::attribute_reference::proptest_generators::*;
+    use crate::contexts::context::proptest_generators::*;
+    use crate::rule::Op;
+    use crate::AttributeValue;
+    use proptest::{collection::vec, prelude::*};
+
+    prop_compose! {
+        // Generate arbitrary clauses. The clauses op will always be fixed to Op::In,
+        // and the values array will contain between 0-5 AtrributeValue::Bool elements.
+        pub(crate) fn any_clause()(
+            kind in any_kind(),
+            // reference is any_ref(), rather than any_valid_ref(), because we also want
+            // coverage of invalid references.
+            reference in any_ref(),
+            negate in any::<bool>(),
+            values in vec(any::<bool>(), 0..5),
+            op in any::<Op>()
+        ) -> Clause {
+            Clause {
+                context_kind: kind,
+                attribute: reference,
+                negate,
+                op,
+                values: values.iter().map(|&b| AttributeValue::from(b)).collect()
+            }
+        }
+    }
+}
+
 /// FlagRule describes a single rule within a feature flag.
 ///
-/// A rule consists of a set of ANDed matching conditions (Clause) for a user, along with either a
-/// fixed variation or a set of rollout percentages to use if the user matches all of the clauses.
+/// A rule consists of a set of ANDed matching conditions ([Clause]) for a context, along with either a
+/// fixed variation or a set of rollout percentages to use if the context matches all of the clauses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlagRule {
     /// A randomized identifier assigned to each rule when it is created.
     ///
     /// This is used to populate the id property of [crate::Reason]
+    #[serde(default)]
     pub id: String,
     clauses: Vec<Clause>,
 
-    /// Defines what variation to return if the user matches this rule.
+    /// Defines what variation to return if the context matches this rule.
     #[serde(flatten)]
     pub variation_or_rollout: VariationOrRollout,
 
@@ -45,6 +150,7 @@ pub struct FlagRule {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 enum Op {
     In,
@@ -67,11 +173,16 @@ enum Op {
 }
 
 impl Clause {
-    fn matches(&self, user: &User, store: &dyn Store) -> bool {
+    pub(crate) fn matches(
+        &self,
+        context: &Context,
+        store: &dyn Store,
+        evaluation_stack: &mut EvaluationStack,
+    ) -> Result<bool, String> {
         if let Op::SegmentMatch = self.op {
-            self.matches_segment(user, store)
+            self.matches_segment(context, store, evaluation_stack)
         } else {
-            self.matches_non_segment(user)
+            self.matches_non_segment(context)
         }
     }
 
@@ -83,72 +194,134 @@ impl Clause {
         }
     }
 
-    pub(crate) fn matches_segment(&self, user: &User, store: &dyn Store) -> bool {
-        let any_match = self.values.iter().find(|value| {
-            value
-                .as_str()
-                .and_then(|segment_key| store.segment(segment_key))
-                .map(|segment| segment.contains(user))
-                .unwrap_or(false)
-        });
-        self.maybe_negate(any_match.is_some())
+    pub(crate) fn matches_segment(
+        &self,
+        context: &Context,
+        store: &dyn Store,
+        evaluation_stack: &mut EvaluationStack,
+    ) -> Result<bool, String> {
+        for value in self.values.iter() {
+            if let Some(segment_key) = value.as_str() {
+                if let Some(segment) = store.segment(segment_key) {
+                    let matches = segment.contains(context, store, evaluation_stack)?;
+                    if matches {
+                        return Ok(self.maybe_negate(true));
+                    }
+                }
+            }
+        }
+
+        Ok(self.maybe_negate(false))
     }
 
-    pub(crate) fn matches_non_segment(&self, user: &User) -> bool {
-        let user_val = match user.value_of(&self.attribute) {
-            // null attributes always imply false, regardless of clause negation
-            Some(AttributeValue::Null) | None => return false,
-            Some(v) => v,
-        };
+    pub(crate) fn matches_non_segment(&self, context: &Context) -> Result<bool, String> {
+        if !self.attribute.is_valid() {
+            return Err(self.attribute.error());
+        }
 
-        let any_match = user_val.find(|user_val_v| {
-            let any_match_for_v = self
-                .values
-                .iter()
-                .find(|clause_val| self.op.matches(user_val_v, clause_val));
-            any_match_for_v.is_some()
-        });
+        if self.attribute.is_kind() {
+            for clause_value in &self.values {
+                for kind in context.kinds().iter() {
+                    if self
+                        .op
+                        .matches(&AttributeValue::String(kind.to_string()), clause_value)
+                    {
+                        return Ok(self.maybe_negate(true));
+                    }
+                }
+            }
+            return Ok(self.maybe_negate(false));
+        }
 
-        self.maybe_negate(any_match.is_some())
+        if let Some(actual_context) = context.as_kind(&self.context_kind) {
+            return match actual_context.get_value(&self.attribute) {
+                None | Some(AttributeValue::Null) => Ok(false),
+                Some(AttributeValue::Array(context_values)) => {
+                    for clause_value in &self.values {
+                        for context_value in context_values.iter() {
+                            if self.op.matches(context_value, clause_value) {
+                                return Ok(self.maybe_negate(true));
+                            }
+                        }
+                    }
+
+                    Ok(self.maybe_negate(false))
+                }
+                Some(context_value) => {
+                    if self
+                        .values
+                        .iter()
+                        .any(|clause_value| self.op.matches(&context_value, clause_value))
+                    {
+                        return Ok(self.maybe_negate(true));
+                    }
+                    Ok(self.maybe_negate(false))
+                }
+            };
+        }
+
+        Ok(false)
     }
 
     #[cfg(test)]
-    pub fn new_match(attribute: &str, value: AttributeValue) -> Self {
+    // Use when matching a clause that has an associated context kind.
+    pub(crate) fn new_match(reference: Reference, value: AttributeValue, kind: Kind) -> Self {
         Self {
-            attribute: attribute.to_string(),
+            attribute: reference,
             negate: false,
             op: Op::Matches,
             values: vec![value],
+            context_kind: kind,
+        }
+    }
+
+    #[cfg(test)]
+    // Use when matching a clause that isn't context-aware.
+    pub(crate) fn new_context_oblivious_match(reference: Reference, value: AttributeValue) -> Self {
+        Self {
+            attribute: reference,
+            negate: false,
+            op: Op::Matches,
+            values: vec![value],
+            context_kind: Kind::default(),
         }
     }
 }
 
 impl FlagRule {
-    /// Determines if a user matches the provided flag rule.
+    /// Determines if a context matches the provided flag rule.
     ///
-    /// A user will match if all flag clauses match; otherwise, this method returns false.
-    pub fn matches(&self, user: &User, store: &dyn Store) -> bool {
+    /// A context will match if all flag clauses match; otherwise, this method returns false.
+    pub(crate) fn matches(
+        &self,
+        context: &Context,
+        store: &dyn Store,
+        evaluation_stack: &mut EvaluationStack,
+    ) -> Result<bool, String> {
         // rules match if _all_ of their clauses do
         for clause in &self.clauses {
-            if !clause.matches(user, store) {
-                return false;
+            let result = clause.matches(context, store, evaluation_stack)?;
+            if !result {
+                return Ok(false);
             }
         }
-        true
+
+        Ok(true)
     }
 
     #[cfg(test)]
-    pub fn new_segment_match(segment_keys: Vec<&str>) -> Self {
+    pub(crate) fn new_segment_match(segment_keys: Vec<&str>, kind: Kind) -> Self {
         Self {
             id: "rule".to_string(),
             clauses: vec![Clause {
-                attribute: "".to_string(),
+                attribute: Reference::new("key"),
                 negate: false,
                 op: Op::SegmentMatch,
                 values: segment_keys
                     .iter()
                     .map(|key| AttributeValue::String(key.to_string()))
                     .collect(),
+                context_kind: kind,
             }],
             variation_or_rollout: VariationOrRollout::Variation { variation: 1 },
             track_events: false,
@@ -233,16 +406,16 @@ fn semver_op<F: Fn(semver::Version, semver::Version) -> bool>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{flag::Flag, ContextBuilder, Segment};
+    use assert_json_diff::assert_json_eq;
+    use maplit::hashmap;
+    use proptest::prelude::*;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::time::SystemTime;
-
-    use maplit::hashmap;
-
-    use super::*;
-    use crate::flag::Flag;
-    use crate::segment::Segment;
-
     struct TestStore;
+    use crate::proptest_generators::*;
 
     impl Store for TestStore {
         fn flag(&self, _flag_key: &str) -> Option<Flag> {
@@ -414,7 +587,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis() as f64;
-        let yesterday_millis = today_millis - 86_400_000 as f64;
+        let yesterday_millis = today_millis - 86_400_000_f64;
 
         // basic UNIX timestamp comparisons
         assert!(Op::Before.matches(&anum(yesterday_millis), &anum(today_millis)));
@@ -501,171 +674,227 @@ mod tests {
     #[test]
     fn test_clause_matches() {
         let one_val_clause = Clause {
-            attribute: "a".into(),
+            attribute: Reference::new("a"),
             negate: false,
             op: Op::In,
             values: vec!["foo".into()],
+            context_kind: Kind::default(),
         };
         let many_val_clause = Clause {
-            attribute: "a".into(),
+            attribute: Reference::new("a"),
             negate: false,
             op: Op::In,
             values: vec!["foo".into(), "bar".into()],
+            context_kind: Kind::default(),
         };
         let negated_clause = Clause {
-            attribute: "a".into(),
+            attribute: Reference::new("a"),
             negate: true,
             op: Op::In,
             values: vec!["foo".into()],
+            context_kind: Kind::default(),
         };
         let negated_many_val_clause = Clause {
-            attribute: "a".into(),
+            attribute: Reference::new("a"),
             negate: true,
             op: Op::In,
             values: vec!["foo".into(), "bar".into()],
+            context_kind: Kind::default(),
         };
         let key_clause = Clause {
-            attribute: "key".into(),
+            attribute: Reference::new("key"),
             negate: false,
             op: Op::In,
-            values: vec!["mu".into()],
+            values: vec!["matching".into()],
+            context_kind: Kind::default(),
         };
 
-        let matching_user = User::with_key("mu")
-            .custom(hashmap! {"a".into() => "foo".into()})
-            .build();
-        let non_matching_user = User::with_key("nmu")
-            .custom(hashmap! {"a".into() => "lol".into()})
-            .build();
-        let user_without_attr = User::with_key("uwa").build();
+        let mut context_builder = ContextBuilder::new("without");
+        let context_without_attribute = context_builder.build().expect("Failed to build context");
 
-        assert!(one_val_clause.matches(&matching_user, &TestStore {}));
-        assert!(!one_val_clause.matches(&non_matching_user, &TestStore {}));
-        assert!(!one_val_clause.matches(&user_without_attr, &TestStore {}));
+        context_builder
+            .key("matching")
+            .set_value("a", AttributeValue::String("foo".to_string()));
+        let matching_context = context_builder.build().expect("Failed to build context");
 
-        assert!(!negated_clause.matches(&matching_user, &TestStore {}));
-        assert!(negated_clause.matches(&non_matching_user, &TestStore {}));
+        context_builder
+            .key("non-matching")
+            .set_value("a", AttributeValue::String("lol".to_string()));
+        let non_matching_context = context_builder.build().expect("Failed to build context");
+
+        let mut evaluation_stack = EvaluationStack::default();
+
+        assert!(one_val_clause
+            .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!one_val_clause
+            .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!one_val_clause
+            .matches(
+                &context_without_attribute,
+                &TestStore {},
+                &mut evaluation_stack
+            )
+            .unwrap());
+
+        assert!(!negated_clause
+            .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(negated_clause
+            .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
 
         assert!(
-            !negated_clause.matches(&user_without_attr, &TestStore {}),
+            !negated_clause
+                .matches(
+                    &context_without_attribute,
+                    &TestStore {},
+                    &mut evaluation_stack
+                )
+                .unwrap(),
             "targeting missing attribute does not match even when negated"
         );
 
         assert!(
-            many_val_clause.matches(&matching_user, &TestStore {}),
+            many_val_clause
+                .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+                .unwrap(),
             "requires only one of the values"
         );
-        assert!(!many_val_clause.matches(&non_matching_user, &TestStore {}));
-        assert!(!many_val_clause.matches(&user_without_attr, &TestStore {}));
+        assert!(!many_val_clause
+            .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!many_val_clause
+            .matches(
+                &context_without_attribute,
+                &TestStore {},
+                &mut evaluation_stack
+            )
+            .unwrap());
 
         assert!(
-            !negated_many_val_clause.matches(&matching_user, &TestStore {}),
+            !negated_many_val_clause
+                .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+                .unwrap(),
             "requires all values are missing"
         );
-        assert!(negated_many_val_clause.matches(&non_matching_user, &TestStore {}));
+        assert!(negated_many_val_clause
+            .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
 
         assert!(
-            !negated_many_val_clause.matches(&user_without_attr, &TestStore {}),
+            !negated_many_val_clause
+                .matches(
+                    &context_without_attribute,
+                    &TestStore {},
+                    &mut evaluation_stack
+                )
+                .unwrap(),
             "targeting missing attribute does not match even when negated"
         );
 
         assert!(
-            key_clause.matches(&matching_user, &TestStore {}),
+            key_clause
+                .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+                .unwrap(),
             "should match key"
         );
         assert!(
-            !key_clause.matches(&non_matching_user, &TestStore {}),
+            !key_clause
+                .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+                .unwrap(),
             "should not match non-matching key"
         );
 
-        let user_with_many = User::with_key("uwm")
-            .custom(hashmap! {"a".into() => vec!["foo", "bar", "lol"].into()})
-            .build();
+        context_builder.key("with-many").set_value(
+            "a",
+            AttributeValue::Array(vec![
+                AttributeValue::String("foo".to_string()),
+                AttributeValue::String("bar".to_string()),
+                AttributeValue::String("lol".to_string()),
+            ]),
+        );
+        let context_with_many = context_builder.build().expect("Failed to build context");
 
-        assert!(one_val_clause.matches(&user_with_many, &TestStore {}));
-        assert!(many_val_clause.matches(&user_with_many, &TestStore {}));
+        assert!(one_val_clause
+            .matches(&context_with_many, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(many_val_clause
+            .matches(&context_with_many, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
 
-        assert!(!negated_clause.matches(&user_with_many, &TestStore {}));
-        assert!(!negated_many_val_clause.matches(&user_with_many, &TestStore {}));
+        assert!(!negated_clause
+            .matches(&context_with_many, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!negated_many_val_clause
+            .matches(&context_with_many, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
     }
 
     struct AttributeTestCase {
-        matching_user: User,
-        non_matching_user: User,
-        user_without_attr: Option<User>,
+        matching_context: Context,
+        non_matching_context: Context,
+        context_without_attribute: Option<Context>,
     }
 
     #[test]
     fn test_clause_matches_attributes() {
         let tests: HashMap<&str, AttributeTestCase> = hashmap! {
             "key" => AttributeTestCase {
-                matching_user: User::with_key("match").build(),
-                non_matching_user: User::with_key("nope").build(),
-                user_without_attr: None,
-            },
-            "secondary" => AttributeTestCase {
-                matching_user: User::with_key("mu").secondary("match").build(),
-                non_matching_user: User::with_key("nmu").secondary("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "ip" => AttributeTestCase {
-                matching_user: User::with_key("mu").ip("match").build(),
-                non_matching_user: User::with_key("nmu").ip("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "country" => AttributeTestCase {
-                matching_user: User::with_key("mu").country("match").build(),
-                non_matching_user: User::with_key("nmu").country("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "email" => AttributeTestCase {
-                matching_user: User::with_key("mu").email("match").build(),
-                non_matching_user: User::with_key("nmu").email("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "firstName" => AttributeTestCase {
-                matching_user: User::with_key("mu").first_name("match").build(),
-                non_matching_user: User::with_key("nmu").first_name("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "lastName" => AttributeTestCase {
-                matching_user: User::with_key("mu").last_name("match").build(),
-                non_matching_user: User::with_key("nmu").last_name("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
-            },
-            "avatar" => AttributeTestCase {
-                matching_user: User::with_key("mu").avatar("match").build(),
-                non_matching_user: User::with_key("nmu").avatar("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
+                matching_context: ContextBuilder::new("match").build().unwrap(),
+                non_matching_context: ContextBuilder::new("nope").build().unwrap(),
+                context_without_attribute: None,
             },
             "name" => AttributeTestCase {
-                matching_user: User::with_key("mu").name("match").build(),
-                non_matching_user: User::with_key("nmu").name("nope").build(),
-                user_without_attr: Some(User::with_key("uwa").build()),
+                matching_context: ContextBuilder::new("matching").name("match").build().unwrap(),
+                non_matching_context: ContextBuilder::new("non-matching").name("nope").build().unwrap(),
+                context_without_attribute: Some(ContextBuilder::new("without-attribute").build().unwrap()),
             },
         };
 
+        let mut evaluation_stack = EvaluationStack::default();
+
         for (attr, test_case) in tests {
             let clause = Clause {
-                attribute: attr.into(),
+                attribute: Reference::new(attr),
                 negate: false,
                 op: Op::In,
                 values: vec!["match".into()],
+                context_kind: Kind::default(),
             };
 
             assert!(
-                clause.matches(&test_case.matching_user, &TestStore {}),
+                clause
+                    .matches(
+                        &test_case.matching_context,
+                        &TestStore {},
+                        &mut evaluation_stack
+                    )
+                    .unwrap(),
                 "should match {}",
                 attr
             );
             assert!(
-                !clause.matches(&test_case.non_matching_user, &TestStore {}),
+                !clause
+                    .matches(
+                        &test_case.non_matching_context,
+                        &TestStore {},
+                        &mut evaluation_stack
+                    )
+                    .unwrap(),
                 "should not match non-matching {}",
                 attr
             );
-            if let Some(user_without_attr) = test_case.user_without_attr {
+            if let Some(context_without_attribute) = test_case.context_without_attribute {
                 assert!(
-                    !clause.matches(&user_without_attr, &TestStore {}),
+                    !clause
+                        .matches(
+                            &context_without_attribute,
+                            &TestStore {},
+                            &mut evaluation_stack
+                        )
+                        .unwrap(),
                     "should not match user with null {}",
                     attr
                 );
@@ -676,56 +905,84 @@ mod tests {
     #[test]
     fn test_clause_matches_anonymous_attribute() {
         let clause = Clause {
-            attribute: "anonymous".into(),
+            attribute: Reference::new("anonymous"),
             negate: false,
             op: Op::In,
             values: vec![true.into()],
+            context_kind: Kind::default(),
         };
 
-        let anon_user = User::with_key("anon").anonymous(true).build();
-        let non_anon_user = User::with_key("nonanon").anonymous(false).build();
-        let implicitly_non_anon_user = User::with_key("implicit").build();
+        let anon_context = ContextBuilder::new("anon").anonymous(true).build().unwrap();
+        let non_anon_context = ContextBuilder::new("nonanon")
+            .anonymous(false)
+            .build()
+            .unwrap();
+        let implicitly_non_anon_context = ContextBuilder::new("implicit").build().unwrap();
 
-        assert!(clause.matches(&anon_user, &TestStore {}));
-        assert!(!clause.matches(&non_anon_user, &TestStore {}));
-        assert!(!clause.matches(&implicitly_non_anon_user, &TestStore {}));
+        let mut evaluation_stack = EvaluationStack::default();
+        assert!(clause
+            .matches(&anon_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!clause
+            .matches(&non_anon_context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
+        assert!(!clause
+            .matches(
+                &implicitly_non_anon_context,
+                &TestStore {},
+                &mut evaluation_stack
+            )
+            .unwrap());
     }
 
     #[test]
     fn test_clause_matches_custom_attributes() {
-        for attr in vec![
-            "custom",  // check we can have an attribute called "custom"
-            "custom1", // check custom attributes work the same
-        ] {
+        // check we can have an attribute called "custom"
+        for attr in &["custom", "custom1"] {
             let clause = Clause {
-                attribute: attr.into(),
+                attribute: Reference::new(attr),
                 negate: false,
                 op: Op::In,
                 values: vec!["match".into()],
+                context_kind: Kind::default(),
             };
 
-            let matching_user = User::with_key("mu")
-                .custom(hashmap! {attr.into() => "match".into()})
-                .build();
-            let non_matching_user = User::with_key("nmu")
-                .custom(hashmap! {attr.into() => "nope".into()})
-                .build();
-            let user_without_attr = User::with_key("uwa")
-                .custom(hashmap! {attr.into() => AttributeValue::Null})
-                .build();
+            let matching_context = ContextBuilder::new("matching")
+                .set_value(attr, AttributeValue::String("match".into()))
+                .build()
+                .unwrap();
+            let non_matching_context = ContextBuilder::new("non-matching")
+                .set_value(attr, AttributeValue::String("nope".into()))
+                .build()
+                .unwrap();
+            let context_without_attribute = ContextBuilder::new("without_attribute")
+                .set_value(attr, AttributeValue::Null)
+                .build()
+                .unwrap();
 
+            let mut evaluation_stack = EvaluationStack::default();
             assert!(
-                clause.matches(&matching_user, &TestStore {}),
+                clause
+                    .matches(&matching_context, &TestStore {}, &mut evaluation_stack)
+                    .unwrap(),
                 "should match {}",
                 attr
             );
             assert!(
-                !clause.matches(&non_matching_user, &TestStore {}),
+                !clause
+                    .matches(&non_matching_context, &TestStore {}, &mut evaluation_stack)
+                    .unwrap(),
                 "should not match non-matching {}",
                 attr
             );
             assert!(
-                !clause.matches(&user_without_attr, &TestStore {}),
+                !clause
+                    .matches(
+                        &context_without_attribute,
+                        &TestStore {},
+                        &mut evaluation_stack
+                    )
+                    .unwrap(),
                 "should not match user with null {}",
                 attr
             );
@@ -734,11 +991,12 @@ mod tests {
 
     #[test]
     fn test_null_attribute() {
-        let user_null_attr = User::with_key("key")
-            .custom(hashmap!["attr".to_string() => AttributeValue::Null])
-            .build();
+        let context_null_attr = ContextBuilder::new("key")
+            .set_value("attr", AttributeValue::Null)
+            .build()
+            .unwrap();
 
-        let user_missing_attr = User::with_key("key").build();
+        let context_missing_attr = ContextBuilder::new("key").build().unwrap();
 
         let clause_values = vec![
             AttributeValue::Bool(true),
@@ -771,19 +1029,25 @@ mod tests {
         ] {
             for neg in &[true, false] {
                 let clause = Clause {
-                    attribute: "attr".to_string(),
+                    attribute: Reference::new("attr"),
                     negate: *neg,
                     op: *op,
                     values: clause_values.clone(),
+                    context_kind: Kind::default(),
                 };
+                let mut evaluation_stack = EvaluationStack::default();
                 assert!(
-                    !clause.matches(&user_null_attr, &TestStore {}),
+                    !clause
+                        .matches(&context_null_attr, &TestStore {}, &mut evaluation_stack)
+                        .unwrap(),
                     "Null attribute matches operator {:?} when {}negated",
                     clause.op,
                     if *neg { "" } else { "not " },
                 );
                 assert!(
-                    !clause.matches(&user_missing_attr, &TestStore {}),
+                    !clause
+                        .matches(&context_missing_attr, &TestStore {}, &mut evaluation_stack)
+                        .unwrap(),
                     "Missing attribute matches operator {:?} when {}negated",
                     clause.op,
                     if *neg { "" } else { "not " },
@@ -794,33 +1058,82 @@ mod tests {
 
     // The following test cases are ported from the Go implementation:
     // https://github.com/launchdarkly/go-server-sdk-evaluation/blob/v1/ldmodel/match_clause_operator_test.go#L28-L155
-    fn clause_test_case<S, T>(op: Op, user_value: S, clause_value: T, expected: bool)
+    fn clause_test_case<S, T>(op: Op, context_value: S, clause_value: T, expected: bool)
     where
         AttributeValue: From<S>,
         AttributeValue: From<T>,
+        S: Clone,
+        T: Clone,
     {
         let clause = Clause {
-            attribute: "attr".to_string(),
+            attribute: Reference::new("attr"),
             negate: false,
             op,
             values: match clause_value.into() {
                 AttributeValue::Array(vec) => vec,
                 other => vec![other],
             },
+            context_kind: Kind::default(),
         };
 
-        let user = User::with_key("key")
-            .custom(hashmap!["attr".to_string() => user_value.into()])
-            .build();
+        let context = ContextBuilder::new("key")
+            .set_value("attr", context_value.into())
+            .build()
+            .unwrap();
+
+        let mut evaluation_stack = EvaluationStack::default();
         assert_eq!(
-            clause.matches(&user, &TestStore {}),
+            clause
+                .matches(&context, &TestStore {}, &mut evaluation_stack)
+                .unwrap(),
             expected,
             "{:?} {:?} {:?} should be {}",
-            user.value_of("attr").unwrap(),
+            context.get_value(&Reference::new("attr")).unwrap(),
             clause.op,
             clause.values,
             &expected
         );
+    }
+
+    #[test]
+    fn match_is_false_on_invalid_reference() {
+        let clause = Clause {
+            attribute: Reference::new("/"),
+            negate: false,
+            op: Op::In,
+            values: vec![],
+            context_kind: Kind::default(),
+        };
+
+        let context = ContextBuilder::new("key")
+            .set_value("attr", true.into())
+            .build()
+            .unwrap();
+        let mut evaluation_stack = EvaluationStack::default();
+        assert!(clause
+            .matches(&context, &TestStore {}, &mut evaluation_stack)
+            .is_err());
+    }
+
+    #[test]
+    fn match_is_false_no_context_matches() {
+        let clause = Clause {
+            attribute: Reference::new("attr"),
+            negate: false,
+            op: Op::In,
+            values: vec![true.into()],
+            context_kind: Kind::default(),
+        };
+
+        let context = ContextBuilder::new("key")
+            .kind("org")
+            .set_value("attr", true.into())
+            .build()
+            .unwrap();
+        let mut evaluation_stack = EvaluationStack::default();
+        assert!(!clause
+            .matches(&context, &TestStore {}, &mut evaluation_stack)
+            .unwrap());
     }
 
     #[test]
@@ -960,5 +1273,126 @@ mod tests {
         clause_test_case(Op::SemVerGreaterThan, "2.0", "2.0.1", false);
         clause_test_case(Op::SemVerGreaterThan, "2.0.1", "xbad%ver", false);
         clause_test_case(Op::SemVerGreaterThan, "2.0.0-rc.1", "2.0.0-rc.0", true);
+    }
+
+    #[test]
+    fn clause_deserialize_with_attribute_missing_causes_error() {
+        let attribute_missing = json!({
+            "op" : "in",
+            "values" : [],
+        });
+        assert!(serde_json::from_value::<IntermediateClause>(attribute_missing).is_err());
+    }
+
+    #[test]
+    fn clause_deserialize_with_op_missing_causes_error() {
+        let op_missing = json!({
+            "values" : [],
+            "attribute" : "",
+        });
+        assert!(serde_json::from_value::<IntermediateClause>(op_missing).is_err());
+    }
+
+    #[test]
+    fn clause_deserialize_with_values_missing_causes_error() {
+        let values_missing = json!({
+            "op" : "in",
+            "values" : [],
+        });
+        assert!(serde_json::from_value::<IntermediateClause>(values_missing).is_err());
+    }
+
+    #[test]
+    fn clause_deserialize_with_required_fields_parses_successfully() {
+        let all_required_fields_present = json!({
+            "attribute" : "",
+            "op" : "in",
+            "values" : [],
+        });
+
+        assert_eq!(
+            serde_json::from_value::<IntermediateClause>(all_required_fields_present).unwrap(),
+            IntermediateClause::ContextOblivious(ClauseWithoutKind {
+                attribute: AttributeName::default(),
+                negate: false,
+                op: Op::In,
+                values: vec![]
+            })
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_clause_serialization_rountrip(clause in any_clause()) {
+            let json = serde_json::to_value(&clause).expect("a clause should serialize");
+            let parsed: Clause = serde_json::from_value(json.clone()).expect("a clause should parse");
+            assert_json_eq!(json, parsed);
+        }
+    }
+
+    #[test]
+    fn clause_with_negate_omitted_defaults_to_false() {
+        let negate_omitted = json!({
+            "attribute" : "",
+            "op" : "in",
+            "values" : [],
+        });
+
+        assert!(
+            !serde_json::from_value::<Clause>(negate_omitted)
+                .unwrap()
+                .negate
+        )
+    }
+
+    #[test]
+    fn clause_with_empty_attribute_defaults_to_invalid_attribute() {
+        let empty_attribute = json!({
+            "attribute" : "",
+            "op" : "in",
+            "values" : [],
+        });
+
+        let attr = serde_json::from_value::<Clause>(empty_attribute)
+            .unwrap()
+            .attribute;
+        assert_eq!(Reference::default(), attr);
+    }
+
+    proptest! {
+        #[test]
+        fn clause_with_context_kind_implies_attribute_references(arbitrary_attribute in any::<String>()) {
+            let with_context_kind = json!({
+                "attribute" : arbitrary_attribute,
+                "op" : "in",
+                "values" : [],
+                "contextKind" : "user",
+            });
+
+            prop_assert_eq!(
+                Reference::new(arbitrary_attribute),
+                serde_json::from_value::<Clause>(with_context_kind)
+                    .unwrap()
+                    .attribute
+            )
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn clause_without_context_kind_implies_literal_attribute_name(arbitrary_attribute in any_valid_ref_string()) {
+            let without_context_kind = json!({
+                "attribute" : arbitrary_attribute,
+                "op" : "in",
+                "values" : [],
+            });
+
+            prop_assert_eq!(
+                Reference::from(AttributeName::new(arbitrary_attribute)),
+                serde_json::from_value::<Clause>(without_context_kind)
+                .unwrap()
+                .attribute
+            );
+        }
     }
 }

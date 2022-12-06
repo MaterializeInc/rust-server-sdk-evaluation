@@ -26,7 +26,6 @@ All notable changes to the project will be documented in this file. This project
 ### Changed
 - If we receive a negative variation index, or an unsupported operation, the
   SDK should not fail to parse the payload.
-- Modified the `try_map` function to accept a default value when returning a new Detail instance.
 
 ## [1.0.0-beta.2] - 2022-01-21
 ### Changed

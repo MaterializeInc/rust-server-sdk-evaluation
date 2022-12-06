@@ -2,8 +2,6 @@
 
 [![Circle CI](https://circleci.com/gh/launchdarkly/rust-server-sdk-evaluation.svg?style=shield)](https://circleci.com/gh/launchdarkly/rust-server-sdk-evaluation)
 
-*This version of the evaluation engine is a **beta** version and should not be considered ready for production use while this message is visible.*
-
 ## LaunchDarkly overview
 
 [LaunchDarkly](https://www.launchdarkly.com) is a feature management platform that serves over 100 billion feature flags daily to help teams build better software, faster. [Get started](https://docs.launchdarkly.com/home/getting-started) using LaunchDarkly today!

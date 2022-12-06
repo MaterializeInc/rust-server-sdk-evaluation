@@ -11,3 +11,7 @@ pub(crate) fn f64_to_i64_safe(f: f64) -> Option<i64> {
         None
     }
 }
+
+pub(crate) fn is_false(b: &bool) -> bool {
+    !(*b)
+}

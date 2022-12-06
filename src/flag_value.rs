@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::util::f64_to_i64_safe;
 
 /// FlagValue represents any of the data types supported by JSON, all of which can be used for a
-/// LaunchDarkly feature flag variation or a custom user attribute.
+/// LaunchDarkly feature flag variation or a custom context attribute.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum FlagValue {
@@ -157,5 +157,57 @@ mod tests {
         test_case("true", FlagValue::Bool(true));
         test_case("\"foo\"", FlagValue::Str("foo".to_string()));
         test_case("{}", FlagValue::Json(json!({})));
+    }
+
+    #[test]
+    fn can_handle_converting_between_types() {
+        let value: FlagValue = true.into();
+        assert_eq!(Some(true), value.as_bool());
+        assert!(value.as_string().is_none());
+        assert!(value.as_float().is_none());
+        assert!(value.as_float().is_none());
+        assert!(value.as_int().is_none());
+
+        let value: FlagValue = String::from("testing").into();
+        assert!(value.as_bool().is_none());
+        assert_eq!(Some(String::from("testing")), value.as_string());
+        assert!(value.as_float().is_none());
+        assert!(value.as_float().is_none());
+        assert!(value.as_int().is_none());
+
+        let value: FlagValue = 1_f64.into();
+        assert!(value.as_bool().is_none());
+        assert!(value.as_string().is_none());
+        assert_eq!(Some(1_f64), value.as_float());
+        assert_eq!(Some(1_i64), value.as_int());
+
+        let value: FlagValue = 1_i64.into();
+        assert!(value.as_bool().is_none());
+        assert!(value.as_string().is_none());
+        assert_eq!(Some(1_f64), value.as_float());
+        assert_eq!(Some(1_i64), value.as_int());
+
+        let value: FlagValue = serde_json::Value::Bool(true).into();
+        assert_eq!(Some(true), value.as_bool());
+        assert_eq!(Some(serde_json::Value::Bool(true)), value.as_json());
+
+        let value: FlagValue = serde_json::Value::String("testing".to_string()).into();
+        assert_eq!(Some(String::from("testing")), value.as_string());
+        assert_eq!(
+            Some(serde_json::Value::String("testing".to_string())),
+            value.as_json()
+        );
+
+        let value: FlagValue = json!(1_f64).into();
+        assert_eq!(Some(1_f64), value.as_float());
+        assert_eq!(Some(json!(1_f64)), value.as_json());
+
+        let value: FlagValue = serde_json::Value::Array(vec![serde_json::Value::Bool(true)]).into();
+        assert_eq!(
+            Some(serde_json::Value::Array(vec![serde_json::Value::Bool(
+                true
+            )])),
+            value.as_json()
+        );
     }
 }

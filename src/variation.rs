@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{user::User, BucketPrefix};
+use crate::contexts::attribute_reference::AttributeName;
+use crate::util::is_false;
+use crate::{
+    contexts::context::{BucketPrefix, Kind},
+    Context, Reference,
+};
+use serde_with::skip_serializing_none;
 
 /// A type representing the index into the [crate::Flag]'s variations.
 pub type VariationIndex = isize;
@@ -40,22 +46,130 @@ impl Default for RolloutKind {
     }
 }
 
-/// Rollout describes how users will be bucketed into variations during a percentage rollout.
+/// Rollout describes how contexts will be bucketed into variations during a percentage rollout.
+// Rollout is deserialized via a helper, IntermediateRollout, because of semantic ambiguity
+// of the bucketBy Reference field.
+//
+// Rollout implements Serialize directly without a helper because References can serialize
+// themselves without any ambiguity.
+#[skip_serializing_none]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "IntermediateRollout")]
 pub struct Rollout {
-    #[serde(default)]
-    kind: RolloutKind,
-    bucket_by: Option<String>,
+    // Specifies if this rollout is a simple rollout or an experiment. Should default to rollout
+    // if absent.
+    kind: Option<RolloutKind>,
+    // Context kind associated with this rollout.
+    context_kind: Option<Kind>,
+    // Specifies which attribute should be used to distinguish between Contexts in a rollout.
+    // Can be omitted; evaluation should treat absence as 'key'.
+    bucket_by: Option<Reference>,
+    // Which variations should be included in the rollout, and associated weight.
+    variations: Vec<WeightedVariation>,
+    // Specifies the seed to be used by the hashing algorithm.
+    seed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutWithContextKind {
+    kind: Option<RolloutKind>,
+    context_kind: Kind,
+    // bucketBy deserializes directly into a reference.
+    bucket_by: Option<Reference>,
     variations: Vec<WeightedVariation>,
     seed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutWithoutContextKind {
+    kind: Option<RolloutKind>,
+    bucket_by: Option<AttributeName>,
+    variations: Vec<WeightedVariation>,
+    seed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IntermediateRollout {
+    // RolloutWithContextKind must be listed first in the enum because otherwise
+    // RolloutWithoutContextKind could match the input (by ignoring/discarding
+    // the context_kind field).
+    ContextAware(RolloutWithContextKind),
+    ContextOblivious(RolloutWithoutContextKind),
+}
+
+impl From<IntermediateRollout> for Rollout {
+    fn from(rollout: IntermediateRollout) -> Self {
+        match rollout {
+            IntermediateRollout::ContextAware(fields) => Self {
+                kind: fields.kind,
+                context_kind: Some(fields.context_kind),
+                bucket_by: fields.bucket_by,
+                variations: fields.variations,
+                seed: fields.seed,
+            },
+            IntermediateRollout::ContextOblivious(fields) => Self {
+                kind: fields.kind,
+                context_kind: None,
+                bucket_by: fields.bucket_by.map(Reference::from),
+                variations: fields.variations,
+                seed: fields.seed,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod proptest_generators {
+    use super::*;
+    use crate::proptest_generators::{any_kind, any_ref};
+    use proptest::{collection::vec, option::of, prelude::*};
+
+    prop_compose! {
+        fn any_weighted_variation() (
+            variation in any::<isize>(),
+            weight in any::<f32>(),
+            untracked in any::<bool>()
+        ) -> WeightedVariation {
+            WeightedVariation {
+                variation,
+                weight,
+                untracked
+            }
+        }
+    }
+
+    fn any_rollout_kind() -> BoxedStrategy<RolloutKind> {
+        prop_oneof![Just(RolloutKind::Rollout), Just(RolloutKind::Experiment)].boxed()
+    }
+
+    prop_compose! {
+        pub(crate) fn any_rollout() (
+            kind in of(any_rollout_kind()),
+            context_kind in any_kind(),
+            bucket_by in of(any_ref()),
+            seed in of(any::<i64>()),
+            variations in vec(any_weighted_variation(), 0..2)
+        ) -> Rollout {
+            Rollout {
+                kind,
+                context_kind: Some(context_kind),
+                bucket_by,
+                seed,
+                variations,
+            }
+        }
+    }
 }
 
 impl Rollout {
     #[cfg(test)]
     fn with_variations<V: Into<Vec<WeightedVariation>>>(variations: V) -> Self {
         Rollout {
-            kind: RolloutKind::Rollout,
+            kind: None,
+            context_kind: None,
             bucket_by: None,
             seed: None,
             variations: variations.into(),
@@ -65,7 +179,7 @@ impl Rollout {
     #[cfg(test)]
     fn bucket_by(self, bucket_by: &str) -> Self {
         Rollout {
-            bucket_by: Some(bucket_by.into()),
+            bucket_by: Some(Reference::new(bucket_by)),
             ..self
         }
     }
@@ -100,18 +214,18 @@ pub enum VariationOrRollout {
 
 pub(crate) type VariationWeight = f32;
 
-/// WeightedVariation describes a fraction of users who will receive a specific variation.
+/// WeightedVariation describes a fraction of contexts which will receive a specific variation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WeightedVariation {
-    /// The index of the variation to be returned if the user is in this bucket. This is always a
+    /// The index of the variation to be returned if the context is in this bucket. This is always a
     /// real variation index; it cannot be undefined.
     pub variation: VariationIndex,
 
-    /// The proportion of users who should go into this bucket, as an integer from 0 to 100000.
+    /// The proportion of contexts which should go into this bucket, as an integer from 0 to 100000.
     pub weight: VariationWeight,
 
-    /// Untracked means that users allocated to this variation should not have tracking events sent.
-    #[serde(default)]
+    /// Untracked means that contexts allocated to this variation should not have tracking events sent.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub untracked: bool,
 }
 
@@ -137,11 +251,11 @@ impl VariationOrRollout {
     pub(crate) fn variation(
         &self,
         flag_key: &str,
-        user: &User,
+        context: &Context,
         salt: &str,
-    ) -> Option<BucketResult> {
+    ) -> Result<Option<BucketResult>, String> {
         match self {
-            VariationOrRollout::Variation { variation: var } => Some(var.into()),
+            VariationOrRollout::Variation { variation: var } => Ok(Some(var.into())),
             VariationOrRollout::Rollout {
                 rollout:
                     Rollout {
@@ -149,28 +263,38 @@ impl VariationOrRollout {
                         bucket_by,
                         variations,
                         seed,
+                        context_kind,
                     },
             } => {
-                let is_experiment = kind == &RolloutKind::Experiment;
+                let is_experiment =
+                    kind.as_ref().unwrap_or(&RolloutKind::default()) == &RolloutKind::Experiment;
 
                 let prefix = match seed {
                     Some(seed) => BucketPrefix::Seed(*seed),
                     None => BucketPrefix::KeyAndSalt(flag_key, salt),
                 };
 
-                let bucket = user.bucket(bucket_by.as_deref(), prefix);
+                let (bucket, was_missing_context) = context.bucket(
+                    bucket_by,
+                    prefix,
+                    is_experiment,
+                    context_kind.as_ref().unwrap_or(&Kind::default()),
+                )?;
+
                 let mut sum = 0.0;
                 for variation in variations {
                     sum += variation.weight / 100_000.0;
                     if bucket < sum {
-                        return Some(variation.as_bucket_result(is_experiment));
+                        return Ok(Some(
+                            variation.as_bucket_result(is_experiment && !was_missing_context),
+                        ));
                     }
                 }
-                variations
+                return Ok(variations
                     .last()
-                    .map(|var| var.as_bucket_result(is_experiment))
+                    .map(|var| var.as_bucket_result(is_experiment && !was_missing_context)));
             }
-            VariationOrRollout::Malformed(_) => None,
+            VariationOrRollout::Malformed(_) => Ok(None),
         }
     }
 }
@@ -183,17 +307,16 @@ impl VariationOrRollout {
 
 #[cfg(test)]
 mod consistency_tests {
-    use crate::user::User;
-
     use super::*;
+    use crate::ContextBuilder;
+    use serde_json::json;
     use spectral::prelude::*;
-
-    use maplit::hashmap;
+    use test_case::test_case;
 
     const BUCKET_TOLERANCE: f32 = 0.0000001;
 
     #[test]
-    fn variation_index_for_user() {
+    fn variation_index_for_context() {
         const HASH_KEY: &str = "hashKey";
         const SALT: &str = "saltyA";
 
@@ -204,27 +327,89 @@ mod consistency_tests {
         };
 
         asserting!("userKeyA (bucket 0.42157587) should get variation 0")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyA").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyA").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 0,
                 in_experiment: false,
             });
         asserting!("userKeyB (bucket 0.6708485) should get variation 1")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyB").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyB").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 1,
                 in_experiment: false,
             });
         asserting!("userKeyC (bucket 0.10343106) should get variation 0")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyC").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyC").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 0,
                 in_experiment: false,
             });
     }
 
+    #[test_case(None, "userKeyA", 2)] // 0.42157587,
+    #[test_case(None, "userKeyB", 2)] // 0.6708485,
+    #[test_case(None, "userKeyC", 1)] // 0.10343106,
+    #[test_case(Some(61), "userKeyA", 0)] // 0.09801207,
+    #[test_case(Some(61), "userKeyB", 1)] // 0.14483777,
+    #[test_case(Some(61), "userKeyC", 2)] // 0.9242641,
+    fn testing_experiment_bucketing(
+        seed: Option<i64>,
+        key: &str,
+        expected_variation_index: VariationIndex,
+    ) {
+        const HASH_KEY: &str = "hashKey";
+        const SALT: &str = "saltyA";
+
+        let wv0 = WeightedVariation::new(0, 10_000.0);
+        let wv1 = WeightedVariation::new(1, 20_000.0);
+        let wv2 = WeightedVariation::new(2, 70_000.0);
+
+        let mut rollout = Rollout::with_variations(vec![wv0, wv1, wv2]).bucket_by("intAttr");
+        rollout.kind = Some(RolloutKind::Experiment);
+        rollout.seed = seed;
+        let rollout = VariationOrRollout::Rollout { rollout };
+
+        let result = rollout
+            .variation(
+                HASH_KEY,
+                &ContextBuilder::new(key)
+                    .set_value("intAttr", 0.6708485.into())
+                    .build()
+                    .unwrap(),
+                SALT,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.variation_index, expected_variation_index);
+    }
+
     #[test]
-    fn variation_index_for_user_with_custom_attribute() {
+    fn variation_index_for_context_with_custom_attribute() {
         const HASH_KEY: &str = "hashKey";
         const SALT: &str = "saltyA";
 
@@ -236,13 +421,16 @@ mod consistency_tests {
 
         asserting!("userKeyD (bucket 0.54771423) should get variation 0")
             .that(
-                &rollout.variation(
-                    HASH_KEY,
-                    &User::with_key("userKeyA")
-                        .custom(hashmap! {"intAttr".into() => 33_333.into()})
-                        .build(),
-                    SALT,
-                ),
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyA")
+                            .set_value("intAttr", 33_333.into())
+                            .build()
+                            .unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
             )
             .contains_value(BucketResult {
                 variation_index: 0,
@@ -251,13 +439,16 @@ mod consistency_tests {
 
         asserting!("userKeyD (bucket 0.7309658) should get variation 0")
             .that(
-                &rollout.variation(
-                    HASH_KEY,
-                    &User::with_key("userKeyA")
-                        .custom(hashmap! {"intAttr".into() => 99_999.into()})
-                        .build(),
-                    SALT,
-                ),
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyA")
+                            .set_value("intAttr", 99_999.into())
+                            .build()
+                            .unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
             )
             .contains_value(BucketResult {
                 variation_index: 1,
@@ -266,7 +457,7 @@ mod consistency_tests {
     }
 
     #[test]
-    fn variation_index_for_user_in_experiment() {
+    fn variation_index_for_context_in_experiment() {
         const HASH_KEY: &str = "hashKey";
         const SALT: &str = "saltyA";
 
@@ -288,19 +479,35 @@ mod consistency_tests {
         let rollout = VariationOrRollout::Rollout {
             rollout: Rollout {
                 seed: Some(61),
-                kind: RolloutKind::Experiment,
+                kind: Some(RolloutKind::Experiment),
                 ..Rollout::with_variations(vec![wv0, wv1, wv0_untracked])
             },
         };
 
         asserting!("userKeyA (bucket 0.09801207) should get variation 0 and be in the experiment")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyA").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyA").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 0,
                 in_experiment: true,
             });
         asserting!("userKeyB (bucket 0.14483777) should get variation 1 and be in the experiment")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyB").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyB").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 1,
                 in_experiment: true,
@@ -308,7 +515,15 @@ mod consistency_tests {
         asserting!(
             "userKeyC (bucket 0.9242641) should get variation 0 and not be in the experiment"
         )
-        .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyC").build(), SALT))
+        .that(
+            &rollout
+                .variation(
+                    HASH_KEY,
+                    &ContextBuilder::new("userKeyC").build().unwrap(),
+                    SALT,
+                )
+                .unwrap(),
+        )
         .contains_value(BucketResult {
             variation_index: 0,
             in_experiment: false,
@@ -316,98 +531,162 @@ mod consistency_tests {
     }
 
     #[test]
-    fn bucket_user_by_key() {
+    fn bucket_context_by_key() {
         const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "saltyA");
 
-        let user = User::with_key("userKeyA").build();
-        let bucket = user.bucket(None, PREFIX);
+        let context = ContextBuilder::new("userKeyA").build().unwrap();
+        let (bucket, _) = context.bucket(&None, PREFIX, false, &Kind::user()).unwrap();
         assert_that!(bucket).is_close_to(0.42157587, BUCKET_TOLERANCE);
 
-        let user = User::with_key("userKeyB").build();
-        let bucket = user.bucket(None, PREFIX);
+        let context = ContextBuilder::new("userKeyB").build().unwrap();
+        let (bucket, _) = context.bucket(&None, PREFIX, false, &Kind::user()).unwrap();
         assert_that!(bucket).is_close_to(0.6708485, BUCKET_TOLERANCE);
 
-        let user = User::with_key("userKeyC").build();
-        let bucket = user.bucket(None, PREFIX);
+        let context = ContextBuilder::new("userKeyC").build().unwrap();
+        let (bucket, _) = context.bucket(&None, PREFIX, false, &Kind::user()).unwrap();
         assert_that!(bucket).is_close_to(0.10343106, BUCKET_TOLERANCE);
+
+        let result = context.bucket(&Some(Reference::new("")), PREFIX, false, &Kind::user());
+        assert!(result.is_err());
     }
 
     #[test]
-    fn bucket_user_by_key_with_seed() {
+    fn bucket_context_by_key_with_seed() {
         const PREFIX: BucketPrefix = BucketPrefix::Seed(61);
 
-        let user_a = User::with_key("userKeyA").build();
-        let bucket = user_a.bucket(None, PREFIX);
+        let context_a = ContextBuilder::new("userKeyA").build().unwrap();
+        let (bucket, _) = context_a
+            .bucket(&None, PREFIX, false, &Kind::user())
+            .unwrap();
         assert_that!(bucket).is_close_to(0.09801207, BUCKET_TOLERANCE);
 
-        let user_b = User::with_key("userKeyB").build();
-        let bucket = user_b.bucket(None, PREFIX);
+        let context_b = ContextBuilder::new("userKeyB").build().unwrap();
+        let (bucket, _) = context_b
+            .bucket(&None, PREFIX, false, &Kind::user())
+            .unwrap();
         assert_that!(bucket).is_close_to(0.14483777, BUCKET_TOLERANCE);
 
-        let user_c = User::with_key("userKeyC").build();
-        let bucket = user_c.bucket(None, PREFIX);
+        let context_c = ContextBuilder::new("userKeyC").build().unwrap();
+        let (bucket, _) = context_c
+            .bucket(&None, PREFIX, false, &Kind::user())
+            .unwrap();
         assert_that!(bucket).is_close_to(0.9242641, BUCKET_TOLERANCE);
 
         // changing seed produces different bucket value
-        let bucket = user_a.bucket(None, BucketPrefix::Seed(60));
+        let (bucket, _) = context_a
+            .bucket(&None, BucketPrefix::Seed(60), false, &Kind::user())
+            .unwrap();
         assert_that!(bucket).is_close_to(0.7008816, BUCKET_TOLERANCE)
     }
 
     #[test]
-    fn bucket_user_with_secondary_key() {
+    #[cfg_attr(not(feature = "secondary_key_bucketing"), ignore)]
+    fn bucket_context_with_secondary_key_only_when_feature_enabled() {
         const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "salt");
 
-        let u1 = User::with_key("userKey").build();
-        let u2 = User::with_key("userKey")
-            .secondary("mySecondaryKey")
-            .build();
-        let bucket1 = u1.bucket(None, PREFIX);
-        let bucket2 = u2.bucket(None, PREFIX);
-        assert_that!(bucket1).is_not_equal_to(bucket2);
+        let context1 = ContextBuilder::new("userKey").build().unwrap();
+
+        // can only construct a context w/ secondary by deserializing from implicit user format.
+        let context2: Context = serde_json::from_value(json!({
+            "key" : "userKey",
+            "secondary" : "mySecondaryKey"
+        }))
+        .unwrap();
+
+        let result1 = context1.bucket(&None, PREFIX, false, &Kind::user());
+        let result2 = context2.bucket(&None, PREFIX, false, &Kind::user());
+        assert_that!(result1).is_not_equal_to(result2);
     }
 
     #[test]
-    fn bucket_user_by_int_attr() {
+    #[cfg_attr(feature = "secondary_key_bucketing", ignore)]
+    fn bucket_context_with_secondary_key_does_not_change_result() {
+        const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "salt");
+
+        let context1: Context = ContextBuilder::new("userKey").build().unwrap();
+
+        // can only construct a context w/ secondary by deserializing from implicit user format.
+        let context2: Context = serde_json::from_value(json!({
+            "key" : "userKey",
+            "secondary" : "mySecondaryKey"
+        }))
+        .unwrap();
+
+        let result1 = context1.bucket(&None, PREFIX, false, &Kind::user());
+        let result2 = context2.bucket(&None, PREFIX, false, &Kind::user());
+        assert_that!(result1).is_equal_to(result2);
+    }
+
+    #[test]
+    fn bucket_context_by_int_attr() {
         const USER_KEY: &str = "userKeyD";
         const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "saltyA");
 
-        let custom = hashmap! {
-            "intAttr".into() => 33_333.into(),
-        };
-        let user = User::with_key(USER_KEY).custom(custom).build();
-        let bucket = user.bucket(Some("intAttr"), PREFIX);
+        let context = ContextBuilder::new(USER_KEY)
+            .set_value("intAttr", 33_333.into())
+            .build()
+            .unwrap();
+        let (bucket, _) = context
+            .bucket(
+                &Some(Reference::new("intAttr")),
+                PREFIX,
+                false,
+                &Kind::user(),
+            )
+            .unwrap();
         assert_that!(bucket).is_close_to(0.54771423, BUCKET_TOLERANCE);
 
-        let custom = hashmap! {
-            "stringAttr".into() => "33333".into(),
-        };
-        let user = User::with_key(USER_KEY).custom(custom).build();
-        let bucket2 = user.bucket(Some("stringAttr"), PREFIX);
+        let context = ContextBuilder::new(USER_KEY)
+            .set_value("stringAttr", "33333".into())
+            .build()
+            .unwrap();
+        let (bucket2, _) = context
+            .bucket(
+                &Some(Reference::new("stringAttr")),
+                PREFIX,
+                false,
+                &Kind::user(),
+            )
+            .unwrap();
         assert_that!(bucket).is_close_to(bucket2, BUCKET_TOLERANCE);
     }
 
     #[test]
-    fn bucket_user_by_float_attr_not_allowed() {
+    fn bucket_context_by_float_attr_not_allowed() {
         const USER_KEY: &str = "userKeyE";
         const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "saltyA");
 
-        let custom = hashmap! {
-            "floatAttr".into() => 999.999.into(),
-        };
-        let user = User::with_key(USER_KEY).custom(custom).build();
-        let bucket = user.bucket(Some("floatAttr"), PREFIX);
+        let context = ContextBuilder::new(USER_KEY)
+            .set_value("floatAttr", 999.999.into())
+            .build()
+            .unwrap();
+        let (bucket, _) = context
+            .bucket(
+                &Some(Reference::new("floatAttr")),
+                PREFIX,
+                false,
+                &Kind::user(),
+            )
+            .unwrap();
         assert_that!(bucket).is_close_to(0.0, BUCKET_TOLERANCE);
     }
 
     #[test]
-    fn bucket_user_by_float_attr_that_is_really_an_int_is_allowed() {
+    fn bucket_context_by_float_attr_that_is_really_an_int_is_allowed() {
         const PREFIX: BucketPrefix = BucketPrefix::KeyAndSalt("hashKey", "saltyA");
 
-        let custom = hashmap! {
-            "floatAttr".into() => f64::from(33_333).into()
-        };
-        let user = User::with_key("userKeyE").custom(custom).build();
-        let bucket = user.bucket(Some("floatAttr"), PREFIX);
+        let context = ContextBuilder::new("userKeyE")
+            .set_value("floatAttr", f64::from(33_333).into())
+            .build()
+            .unwrap();
+        let (bucket, _) = context
+            .bucket(
+                &Some(Reference::new("floatAttr")),
+                PREFIX,
+                false,
+                &Kind::user(),
+            )
+            .unwrap();
         assert_that!(bucket).is_close_to(0.54771423, BUCKET_TOLERANCE);
     }
 
@@ -421,16 +700,16 @@ mod consistency_tests {
         let rollout = VariationOrRollout::Rollout {
             rollout: Rollout {
                 seed: Some(61),
-                kind: RolloutKind::Rollout,
+                kind: Some(RolloutKind::Rollout),
                 ..Rollout::with_variations(vec![wv0, wv1])
             },
         };
-        let custom = hashmap! {
-            "intAttr".into() => 99_999.into()
-        };
-        let user = User::with_key("userKeyD").custom(custom).build();
+        let context = ContextBuilder::new("userKeyD")
+            .set_value("intAttr", 99_999.into())
+            .build()
+            .unwrap();
         asserting!("userKeyD should get variation 1 and not be in the experiment")
-            .that(&rollout.variation(HASH_KEY, &user, SALT))
+            .that(&rollout.variation(HASH_KEY, &context, SALT).unwrap())
             .contains_value(BucketResult {
                 variation_index: 1,
                 in_experiment: false,
@@ -447,16 +726,16 @@ mod consistency_tests {
         let rollout = VariationOrRollout::Rollout {
             rollout: Rollout {
                 seed: Some(61),
-                kind: RolloutKind::Experiment,
+                kind: Some(RolloutKind::Experiment),
                 ..Rollout::with_variations(vec![wv0, wv1])
             },
         };
-        let custom = hashmap! {
-            "intAttr".into() => 99_999.into()
-        };
-        let user = User::with_key("userKeyD").custom(custom).build();
+        let context = ContextBuilder::new("userKeyD")
+            .set_value("intAttr", 99_999.into())
+            .build()
+            .unwrap();
         asserting!("userKeyD should get variation 1 and be in the experiment")
-            .that(&rollout.variation(HASH_KEY, &user, SALT))
+            .that(&rollout.variation(HASH_KEY, &context, SALT).unwrap())
             .contains_value(BucketResult {
                 variation_index: 1,
                 in_experiment: true,
@@ -466,10 +745,30 @@ mod consistency_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::user::User;
+    use crate::ContextBuilder;
+    use assert_json_diff::assert_json_eq;
 
     use super::*;
+    use crate::proptest_generators::*;
+    use proptest::prelude::*;
+    use serde_json::json;
     use spectral::prelude::*;
+
+    proptest! {
+        #[test]
+         fn arbitrary_rollout_serialization_roundtrip(rollout in any_rollout()) {
+            let json = serde_json::to_value(&rollout).expect("a rollout should serialize");
+            let parsed: Rollout = serde_json::from_value(json.clone()).expect("a rollout should parse");
+            assert_json_eq!(json, parsed);
+        }
+    }
+
+    #[test]
+    fn rollout_serialize_omits_optional_fields() {
+        let json = json!({"variations" : []});
+        let parsed: Rollout = serde_json::from_value(json.clone()).expect("should parse");
+        assert_json_eq!(json, parsed);
+    }
 
     #[test]
     fn test_parse_variation_or_rollout() {
@@ -491,7 +790,7 @@ mod tests {
         .expect("should parse");
         assert_that!(rollout_bucket_by).is_equal_to(&VariationOrRollout::Rollout {
             rollout: Rollout {
-                bucket_by: Some("bucket".to_string()),
+                bucket_by: Some(Reference::new("bucket")),
                 ..Rollout::with_variations(vec![WeightedVariation::new(1, 100_000.0)])
             },
         });
@@ -524,7 +823,7 @@ mod tests {
         .expect("should parse");
         assert_that!(rollout_experiment).is_equal_to(&VariationOrRollout::Rollout {
             rollout: Rollout {
-                kind: RolloutKind::Experiment,
+                kind: Some(RolloutKind::Experiment),
                 seed: Some(42),
                 ..Rollout::with_variations(vec![
                     WeightedVariation::new(1, 20_000.0),
@@ -538,7 +837,7 @@ mod tests {
         });
 
         let malformed: VariationOrRollout = serde_json::from_str(r#"{}"#).expect("should parse");
-        assert_that!(malformed).is_equal_to(VariationOrRollout::Malformed(serde_json::json!({})));
+        assert_that!(malformed).is_equal_to(VariationOrRollout::Malformed(json!({})));
 
         let overspecified: VariationOrRollout = serde_json::from_str(
             r#"{
@@ -563,7 +862,15 @@ mod tests {
         };
 
         asserting!("userKeyD (bucket 0.7816281) should get variation 2")
-            .that(&rollout.variation(HASH_KEY, &User::with_key("userKeyD").build(), SALT))
+            .that(
+                &rollout
+                    .variation(
+                        HASH_KEY,
+                        &ContextBuilder::new("userKeyD").build().unwrap(),
+                        SALT,
+                    )
+                    .unwrap(),
+            )
             .contains_value(BucketResult {
                 variation_index: 2,
                 in_experiment: false,
