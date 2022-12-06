@@ -1,7 +1,7 @@
 [package]
 name = "launchdarkly-server-sdk-evaluation"
 description = "LaunchDarkly feature flag evaluation engine"
-version = "1.0.0-beta.5"
+version = "1.0.0"
 authors = ["LaunchDarkly"]
 edition = "2021"
 rust-version = "1.60.0"
