@@ -140,8 +140,9 @@ impl AttributeValue {
     /// It will return None if the conversion fails or if no conversion is possible.
     pub fn to_datetime(&self) -> Option<chrono::DateTime<Utc>> {
         match self {
-            AttributeValue::Number(millis) => f64_to_i64_safe(*millis)
-                .and_then(|millis| Utc.timestamp_millis_opt(millis).single()),
+            AttributeValue::Number(millis) => {
+                f64_to_i64_safe(*millis).map(|millis| Utc.timestamp_millis(millis))
+            }
             AttributeValue::String(s) => chrono::DateTime::parse_from_rfc3339(s)
                 .map(|dt| dt.with_timezone(&Utc))
                 .ok(),
@@ -164,10 +165,6 @@ impl AttributeValue {
         semver::Version::parse(version_str)
             .ok()
             .or_else(|| AttributeValue::parse_semver_loose(version_str))
-            .map(|mut version| {
-                version.build = semver::BuildMetadata::EMPTY;
-                version
-            })
     }
 
     fn parse_semver_loose(version_str: &str) -> Option<semver::Version> {

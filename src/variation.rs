@@ -22,7 +22,7 @@ impl From<&VariationIndex> for BucketResult {
 
 /// RolloutKind describes whether a rollout is a simple percentage rollout or represents an
 /// experiment. Experiments have different behaviour for tracking and variation bucketing.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum RolloutKind {
     /// Represents a simple percentage rollout. This is the default rollout kind, and will be assumed if

@@ -77,7 +77,7 @@ pub fn evaluate<'a>(
     }
 
     for (rule_index, rule) in flag.rules.iter().enumerate() {
-        if rule.matches(user, store) {
+        if rule.matches(user, &*store) {
             let result = flag.resolve_variation_or_rollout(&rule.variation_or_rollout, user);
             return match result {
                 Ok(BucketResult {
@@ -111,7 +111,7 @@ pub fn evaluate<'a>(
 
 /// A Detail instance is returned from [evaluate], combining the result of a flag evaluation with
 /// an explanation of how it was calculated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Detail<T> {
     /// The result of the flag evaluation. This will be either one of the flag's variations or None
     /// if no appropriate fallback value was configured.
@@ -243,7 +243,7 @@ impl<T> Detail<T> {
 }
 
 /// Reason describes the reason that a flag evaluation produced a particular value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum Reason {
     /// Off indicates that the flag was off and therefore returned its configured off value.
@@ -305,7 +305,7 @@ impl Reason {
 
 /// Error is returned via a [Reason::Error] when the client could not evaluate a flag, and
 /// provides information about why the flag could not be evaluated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Error {
     /// ClientNotReady indicates that the caller tried to evaluate a flag before the client
